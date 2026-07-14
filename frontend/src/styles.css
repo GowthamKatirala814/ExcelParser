@@ -1,0 +1,273 @@
+/* Plain internal-tool styling: white background, dark text, one accent color
+   used only for buttons and links. No gradients, shadows, cards, pills,
+   icons, or animations. Consistent font sizes; generous whitespace. */
+
+:root {
+  --accent: #1a56db;
+  --accent-dark: #123c9c;
+  --text: #1a1a1a;
+  --muted: #555;
+  --border: #cccccc;
+  --border-light: #e2e2e2;
+  --header-bg: #f4f4f4;
+
+  --fs-title: 1.3rem;
+  --fs-heading: 1.05rem;
+  --fs-body: 0.9rem;
+  --fs-table: 0.85rem;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: Arial, Helvetica, "Segoe UI", sans-serif;
+  background: #ffffff;
+  color: var(--text);
+  font-size: var(--fs-body);
+  line-height: 1.5;
+}
+
+.app {
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 24px 20px 80px;
+}
+
+/* --- Typography --- */
+
+h1 {
+  font-size: var(--fs-title);
+  font-weight: 700;
+  margin: 0 0 4px;
+}
+
+h2,
+h3 {
+  font-size: var(--fs-heading);
+  font-weight: 700;
+  margin: 0 0 10px;
+}
+
+p {
+  margin: 0 0 10px;
+}
+
+.tagline {
+  color: var(--muted);
+  max-width: 620px;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.mono {
+  font-family: Consolas, "Courier New", monospace;
+  font-size: var(--fs-table);
+}
+
+/* --- Sections: separated by whitespace and a thin rule, no cards --- */
+
+section {
+  margin-top: 32px;
+  padding-top: 24px;
+  border-top: 1px solid var(--border-light);
+}
+
+section:first-of-type {
+  border-top: none;
+  padding-top: 0;
+}
+
+/* --- Buttons and links --- */
+
+button {
+  font-family: inherit;
+  font-size: var(--fs-body);
+  cursor: pointer;
+  background: var(--accent);
+  color: #ffffff;
+  border: 1px solid var(--accent);
+  border-radius: 2px;
+  padding: 7px 16px;
+}
+
+button:hover:not(:disabled) {
+  background: var(--accent-dark);
+  border-color: var(--accent-dark);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+button.secondary {
+  background: #ffffff;
+  color: var(--accent);
+  border: 1px solid var(--border);
+}
+
+button.secondary:hover:not(:disabled) {
+  background: #ffffff;
+  border-color: var(--accent);
+}
+
+a {
+  color: var(--accent);
+}
+
+/* Download actions: rectangular bordered links, grouped */
+
+.downloads {
+  margin: 12px 0;
+}
+
+.downloads-label {
+  font-weight: 700;
+  margin: 0 0 6px;
+}
+
+.download-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.download-btn {
+  display: inline-block;
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  padding: 6px 12px;
+  text-decoration: none;
+  color: var(--accent);
+  background: #ffffff;
+  font-size: var(--fs-body);
+}
+
+.download-btn:hover {
+  border-color: var(--accent);
+}
+
+/* --- Forms --- */
+
+input[type="text"],
+input[type="file"] {
+  font-family: inherit;
+  font-size: var(--fs-body);
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  background: #ffffff;
+  color: var(--text);
+}
+
+.field-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  margin: 10px 0;
+}
+
+/* --- Tables --- */
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: var(--fs-table);
+  margin: 8px 0 4px;
+}
+
+th,
+td {
+  border: 1px solid var(--border);
+  padding: 6px 10px;
+  text-align: left;
+  vertical-align: middle;
+}
+
+th {
+  background: var(--header-bg);
+  font-weight: 700;
+}
+
+.table-scroll {
+  max-height: 460px;
+  overflow: auto;
+  border: 1px solid var(--border);
+}
+
+.table-scroll table {
+  margin: 0;
+}
+
+.table-scroll th {
+  position: sticky;
+  top: 0;
+}
+
+/* --- Color swatch: small square + hex text, never a full-row tint --- */
+
+.swatch-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.swatch {
+  width: 14px;
+  height: 14px;
+  border: 1px solid var(--border);
+  display: inline-block;
+  flex: none;
+}
+
+.swatch-none {
+  color: var(--muted);
+  font-style: italic;
+}
+
+/* --- Status / messages --- */
+
+.error {
+  color: #b00020;
+}
+
+.note {
+  color: var(--muted);
+  font-size: var(--fs-body);
+  margin: 6px 0;
+}
+
+.status-line {
+  margin: 4px 0;
+}
+
+.summary-list {
+  margin: 8px 0;
+  padding-left: 18px;
+}
+
+.summary-list li {
+  margin: 2px 0;
+}
+
+/* --- Sheet navigation: plain buttons in a row --- */
+
+.sheet-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 12px 0;
+}
+
+.sheet-nav button.secondary.active {
+  border-color: var(--accent);
+  color: #ffffff;
+  background: var(--accent);
+}
