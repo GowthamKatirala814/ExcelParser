@@ -56,9 +56,33 @@ def _sheet_summary(extraction):
     }
 
 
+def _sheet_warnings(extraction):
+    """Advisory, human-review warnings derived from the descriptive-only
+    extraction passes (embedded images, low-contrast colors). Never affects
+    any data or color value - purely surfaced for a human to double-check."""
+    warnings = []
+
+    images = extraction.get("embedded_images") or []
+    if images:
+        locations = ", ".join(img.get("anchor_cell") or "?" for img in images)
+        warnings.append(
+            f"{len(images)} image(s) detected on this sheet at {locations} - "
+            "their content was not read; check manually if they contain data."
+        )
+
+    for pair in extraction.get("low_contrast_pairs") or []:
+        warnings.append(
+            f"Low-contrast colors {pair.get('color_a')} and {pair.get('color_b')} "
+            f"(Delta-E {pair.get('delta_e')}) - {pair.get('note')}"
+        )
+
+    return warnings
+
+
 def _sheet_payload(extraction):
     return {
         "summary": _sheet_summary(extraction),
+        "warnings": _sheet_warnings(extraction),
         "color_inventory": extraction.get("color_inventory", []),
         "rows": [_row_to_flat(r) for r in extraction.get("rows", [])],
     }
@@ -77,6 +101,12 @@ def sheet_report_csv(extraction):
     summary_writer = csv.writer(buffer)
     for key, value in payload["summary"].items():
         summary_writer.writerow([key, value])
+
+    if payload["warnings"]:
+        buffer.write("\n# Warnings (advisory - check manually)\n")
+        warn_writer = csv.writer(buffer)
+        for warning in payload["warnings"]:
+            warn_writer.writerow([warning])
 
     buffer.write("\n# Color Inventory\n")
     inv_writer = csv.writer(buffer)

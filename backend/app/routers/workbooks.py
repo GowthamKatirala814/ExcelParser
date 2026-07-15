@@ -1,3 +1,4 @@
+import asyncio
 import datetime
 import io
 import json
@@ -13,12 +14,16 @@ from fastapi.responses import StreamingResponse
 from .. import config
 from ..db import extractions_collection, structured_collection, workbooks_collection
 from ..services import reports
+from ..services.extraction_validation import validate_extraction_completeness
 from ..services.extractor import extract_workbook, read_sheet_dimensions
 from ..services.llm_payload import build_llm_payload
+from ..services.lossless_extractor import extract_lossless
 from ..services.raw_export import build_raw_sheet_json, build_raw_workbook_json
 from ..services.structured_assembly import assemble_sheet_structured_output
+from ..services.structured_schema_validation import validate_structured_sheet
 from ..services.structured_validation import validate_sheet_structured_output
 from ..services.structuring_service import StructuringError, generate_structured_json
+from ..services.transformation_engine import transform_sheet, transform_workbook
 
 logger = logging.getLogger("app.structuring")
 
@@ -94,6 +99,25 @@ async def _set_sheet_structuring_state(oid, sheet_name, **fields):
     )
 
 
+# Max Gemini attempts for a single sheet before accepting the best output
+# with its violations recorded. A hard schema-validation failure triggers a
+# retry of ONLY this sheet (never the whole workbook).
+_MAX_SHEET_ATTEMPTS = 2
+
+
+def _build_intermediate_sheet_sync(stored_path, sheet_name):
+    """Deterministic transformation-engine intermediate for one sheet, built
+    from the lossless extraction. Ground truth for structured validation.
+    Runs in a threadpool (CPU-bound openpyxl parse)."""
+    try:
+        lossless = extract_lossless(str(stored_path), only_sheet=sheet_name)
+    except Exception:
+        logger.exception("could not build intermediate for %s", sheet_name)
+        return None
+    sheet = lossless.get("sheets", {}).get(sheet_name)
+    return transform_sheet(sheet) if sheet is not None else None
+
+
 async def _run_structuring_for_sheet(oid, sheet_name):
     await _set_sheet_structuring_state(oid, sheet_name, status="processing", error=None, error_kind=None)
 
@@ -113,41 +137,69 @@ async def _run_structuring_for_sheet(oid, sheet_name):
     # sheet's rows, cells, or tables.
     raw_sheet_json = build_raw_sheet_json(workbook_doc, extraction)
     llm_payload = build_llm_payload(raw_sheet_json)
-
-    try:
-        # The LLM classifies this one sheet's meaning (legend, entity master
-        # data, which row is which entity) - a judgment call. It does NOT
-        # compute any actual date/status value itself.
-        llm_semantics = await generate_structured_json(llm_payload)
-    except StructuringError as exc:
-        logger.error(
-            "structuring failed for workbook %s sheet '%s' (%s): %s",
-            oid, sheet_name, exc.kind, exc,
-        )
-        await _set_sheet_structuring_state(
-            oid, sheet_name,
-            status="failed",
-            error=str(exc),
-            error_kind=exc.kind,
-            generated_at=datetime.datetime.utcnow().isoformat(),
-        )
-        return
-
-    # Every restriction/date range in the final output is computed here,
-    # directly from this sheet's trusted raw cells - the LLM never
-    # transcribes or collapses grid data itself, so it cannot introduce a
-    # date/range error.
     sheet_raw = raw_sheet_json["sheets"][sheet_name]
-    structured_data, assembly_warnings = assemble_sheet_structured_output(sheet_raw, llm_semantics)
-    warnings = assembly_warnings + validate_sheet_structured_output(sheet_name, sheet_raw, structured_data)
 
-    if warnings:
-        logger.warning(
-            "structuring for workbook %s sheet '%s' completed with %d warning(s): %s",
-            oid, sheet_name, len(warnings), warnings,
+    # Deterministic ground truth for validating whatever the LLM returns.
+    stored_path = workbook_doc.get("stored_path")
+    intermediate_sheet = None
+    if stored_path and Path(stored_path).exists():
+        loop = asyncio.get_event_loop()
+        intermediate_sheet = await loop.run_in_executor(
+            None, _build_intermediate_sheet_sync, stored_path, sheet_name
         )
+
+    best = None  # (structured_data, warnings, schema_result)
+    for attempt in range(1, _MAX_SHEET_ATTEMPTS + 1):
+        try:
+            # The LLM classifies this one sheet's meaning; it never computes
+            # actual date/status values.
+            llm_semantics = await generate_structured_json(llm_payload)
+        except StructuringError as exc:
+            logger.error(
+                "structuring failed for workbook %s sheet '%s' (%s): %s",
+                oid, sheet_name, exc.kind, exc,
+            )
+            await _set_sheet_structuring_state(
+                oid, sheet_name,
+                status="failed",
+                error=str(exc),
+                error_kind=exc.kind,
+                generated_at=datetime.datetime.utcnow().isoformat(),
+            )
+            return
+
+        # Every restriction/date range is computed deterministically here from
+        # the trusted raw cells - the LLM never transcribes grid data.
+        structured_data, assembly_warnings = assemble_sheet_structured_output(sheet_raw, llm_semantics)
+        warnings = assembly_warnings + validate_sheet_structured_output(sheet_name, sheet_raw, structured_data)
+
+        if intermediate_sheet is not None:
+            schema_result = validate_structured_sheet(intermediate_sheet, structured_data)
+        else:
+            schema_result = {"valid": True, "hard_violations": [], "warnings": []}
+
+        best = (structured_data, warnings + schema_result["warnings"], schema_result)
+
+        if schema_result["valid"]:
+            break
+        logger.warning(
+            "structuring for %s sheet '%s' failed validation on attempt %d/%d: %s",
+            oid, sheet_name, attempt, _MAX_SHEET_ATTEMPTS, schema_result["hard_violations"],
+        )
+        # loop retries ONLY this sheet
+
+    structured_data, all_warnings, schema_result = best
+    validation_status = "valid" if schema_result["valid"] else "invalid"
+
+    if not schema_result["valid"]:
+        logger.warning(
+            "structuring for %s sheet '%s' accepted with %d unresolved validation issue(s) after %d attempts",
+            oid, sheet_name, len(schema_result["hard_violations"]), _MAX_SHEET_ATTEMPTS,
+        )
+    elif all_warnings:
+        logger.warning("structuring for %s sheet '%s' completed with %d warning(s)", oid, sheet_name, len(all_warnings))
     else:
-        logger.info("structuring for workbook %s sheet '%s' completed cleanly", oid, sheet_name)
+        logger.info("structuring for %s sheet '%s' completed cleanly", oid, sheet_name)
 
     await _set_sheet_structuring_state(
         oid, sheet_name,
@@ -155,7 +207,9 @@ async def _run_structuring_for_sheet(oid, sheet_name):
         error=None,
         error_kind=None,
         data=structured_data,
-        validation_warnings=warnings,
+        validation_warnings=all_warnings,
+        validation_status=validation_status,
+        schema_violations=schema_result["hard_violations"],
         generated_at=datetime.datetime.utcnow().isoformat(),
     )
 
@@ -209,6 +263,9 @@ async def extract(workbook_id: str, background_tasks: BackgroundTasks):
             "rows": result["rows"],
             "raw_cells": result["raw_cells"],
             "structured": result["structured"],
+            "low_contrast_pairs": result.get("low_contrast_pairs", []),
+            "embedded_images": result.get("embedded_images", []),
+            "extraction_summary": result.get("extraction_summary"),
         }
         await extractions_collection.insert_one(extraction_doc)
         sheet_summaries[sheet_name] = {
@@ -438,6 +495,146 @@ async def download_sheet_raw_json(workbook_id: str, sheet_name: str):
     )
 
 
+# --- Lossless raw extraction (full-fidelity, every cell) -------------------
+#
+# Re-parses the stored .xlsx on demand (the file is the source of truth, so
+# the result is always faithful) and runs the CPU-heavy parse in a threadpool
+# so the event loop is never blocked. This is additive - it does not touch
+# the existing compact extract/structuring pipeline.
+
+
+async def _stored_path_or_404(oid):
+    workbook_doc = await workbooks_collection.find_one({"_id": oid})
+    if workbook_doc is None:
+        raise HTTPException(status_code=404, detail="Workbook not found")
+    stored_path = Path(workbook_doc["stored_path"])
+    if not stored_path.exists():
+        raise HTTPException(status_code=410, detail="Stored workbook file is missing")
+    return workbook_doc, stored_path
+
+
+async def _run_lossless(stored_path, filename, only_sheet=None):
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None, lambda: extract_lossless(str(stored_path), filename=filename, only_sheet=only_sheet)
+    )
+
+
+def _json_download(payload, filename):
+    content = json.dumps(payload, indent=2, default=str).encode("utf-8")
+    return StreamingResponse(
+        io.BytesIO(content),
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/{workbook_id}/lossless/raw.json")
+async def download_lossless_workbook(workbook_id: str):
+    """Full-fidelity lossless raw JSON for the whole workbook (every cell,
+    all colour internals, metadata, merges, images)."""
+    oid = _object_id(workbook_id)
+    workbook_doc, stored_path = await _stored_path_or_404(oid)
+    lossless = await _run_lossless(stored_path, workbook_doc.get("filename"))
+    return _json_download(lossless, f"{workbook_doc['filename']}_lossless.json")
+
+
+@router.get("/{workbook_id}/sheets/{sheet_name}/lossless/raw.json")
+async def download_lossless_sheet(workbook_id: str, sheet_name: str):
+    """Full-fidelity lossless raw JSON for exactly one sheet - the lighter,
+    scalable path for large workbooks."""
+    oid = _object_id(workbook_id)
+    workbook_doc, stored_path = await _stored_path_or_404(oid)
+    if sheet_name not in (workbook_doc.get("sheet_names") or []):
+        raise HTTPException(status_code=404, detail=f"Sheet '{sheet_name}' not found in this workbook")
+    lossless = await _run_lossless(stored_path, workbook_doc.get("filename"), only_sheet=sheet_name)
+    return _json_download(lossless, f"{workbook_doc['filename']}_{sheet_name}_lossless.json")
+
+
+@router.get("/{workbook_id}/lossless/validation")
+async def lossless_validation(workbook_id: str):
+    """Deterministic validation report over the lossless extraction: total
+    cells processed, colored cells, formulas, comments, hyperlinks, merged
+    regions, hidden rows/columns, and images - per sheet and in total."""
+    oid = _object_id(workbook_id)
+    workbook_doc, stored_path = await _stored_path_or_404(oid)
+    lossless = await _run_lossless(stored_path, workbook_doc.get("filename"))
+    return {
+        "workbook": workbook_doc.get("filename"),
+        "sheet_count": lossless["workbook"]["sheet_count"],
+        "validation": lossless["validation"],
+    }
+
+
+# --- Deterministic transformation engine (intermediate business-aware JSON) -
+#
+# Converts the lossless raw JSON into the intermediate representation
+# (tables, headers, date columns, colour map, legend candidates, row objects
+# with cell-ref traceability) with NO LLM involvement. Additive - the live
+# structuring flow is unchanged; these let you inspect/validate the
+# deterministic layer across supplier workbooks before it replaces anything.
+
+
+def _lossless_and_intermediate_workbook(stored_path, filename):
+    lossless = extract_lossless(str(stored_path), filename=filename)
+    return lossless, transform_workbook(lossless)
+
+
+def _lossless_and_intermediate_sheet(stored_path, filename, sheet_name):
+    lossless = extract_lossless(str(stored_path), filename=filename, only_sheet=sheet_name)
+    sheet = lossless.get("sheets", {}).get(sheet_name)
+    return transform_sheet(sheet) if sheet is not None else None
+
+
+@router.get("/{workbook_id}/intermediate.json")
+async def download_intermediate_workbook(workbook_id: str):
+    """Deterministic intermediate JSON for the whole workbook."""
+    oid = _object_id(workbook_id)
+    workbook_doc, stored_path = await _stored_path_or_404(oid)
+    loop = asyncio.get_event_loop()
+    _lossless, intermediate = await loop.run_in_executor(
+        None, _lossless_and_intermediate_workbook, str(stored_path), workbook_doc.get("filename")
+    )
+    return _json_download(intermediate, f"{workbook_doc['filename']}_intermediate.json")
+
+
+@router.get("/{workbook_id}/sheets/{sheet_name}/intermediate.json")
+async def download_intermediate_sheet(workbook_id: str, sheet_name: str):
+    """Deterministic intermediate JSON for exactly one sheet."""
+    oid = _object_id(workbook_id)
+    workbook_doc, stored_path = await _stored_path_or_404(oid)
+    if sheet_name not in (workbook_doc.get("sheet_names") or []):
+        raise HTTPException(status_code=404, detail=f"Sheet '{sheet_name}' not found in this workbook")
+    loop = asyncio.get_event_loop()
+    intermediate = await loop.run_in_executor(
+        None, _lossless_and_intermediate_sheet, str(stored_path), workbook_doc.get("filename"), sheet_name
+    )
+    return _json_download(intermediate, f"{workbook_doc['filename']}_{sheet_name}_intermediate.json")
+
+
+@router.get("/{workbook_id}/extraction-validation")
+async def extraction_completeness(workbook_id: str):
+    """
+    Pre-structuring completeness check: independently recounts the workbook
+    from openpyxl and compares against the lossless extraction (cell counts,
+    colored cells, merged ranges, comments, hyperlinks, hidden rows/columns,
+    sheet metadata), plus a legend-usage audit (matching-cell counts per
+    legend colour/code, and colours with no legend meaning).
+    """
+    oid = _object_id(workbook_id)
+    workbook_doc, stored_path = await _stored_path_or_404(oid)
+
+    def _build():
+        lossless, intermediate = _lossless_and_intermediate_workbook(
+            str(stored_path), workbook_doc.get("filename")
+        )
+        return validate_extraction_completeness(str(stored_path), lossless, intermediate)
+
+    loop = asyncio.get_event_loop()
+    report = await loop.run_in_executor(None, _build)
+    return report
+
+
 # --- Structuring progress + per-sheet / workbook-level downloads -----------
 
 
@@ -496,6 +693,8 @@ async def structured_progress(workbook_id: str):
             "error": (d or {}).get("error"),
             "error_kind": (d or {}).get("error_kind"),
             "validation_warnings": (d or {}).get("validation_warnings") or [],
+            "validation_status": (d or {}).get("validation_status"),
+            "schema_violations": (d or {}).get("schema_violations") or [],
             "generated_at": (d or {}).get("generated_at"),
         }
 

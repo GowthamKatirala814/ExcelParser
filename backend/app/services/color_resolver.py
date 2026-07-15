@@ -181,3 +181,62 @@ def resolve_direct_fill(cell, theme_palette=None, theme_error=None):
     result = resolve_color_object(fg, theme_palette, theme_error)
     result["pattern_type"] = pattern_type
     return result
+
+
+# --- Column / row default fill inheritance --------------------------------
+#
+# Excel lets a fill be applied at the column level (<col style="N">) or row
+# level (<row s="N" customFormat="1">) rather than on each cell. A cell with
+# no style of its own then RENDERS with that default fill, even though its own
+# `cell.fill` is empty. Without this, such cells look blank to the extractor
+# even though a human plainly sees them colored. `dim.style` is an index into
+# the workbook's cellXfs table (openpyxl `_cell_styles`), which points at a
+# fill in `_fills`. These are the same internals openpyxl uses itself; guarded
+# so an unexpected shape degrades to "no default" rather than raising.
+
+
+def _style_array_fill(workbook, style_id):
+    """Given a cellXfs index, return the resolved PatternFill's fgColor,
+    or None if that style has no solid fill."""
+    try:
+        style_array = workbook._cell_styles[int(style_id)]
+        fill = workbook._fills[style_array.fillId]
+    except (IndexError, AttributeError, TypeError, ValueError):
+        return None
+    if getattr(fill, "patternType", None) != "solid":
+        return None
+    return getattr(fill, "fgColor", None)
+
+
+def resolve_column_default_fill(cell, worksheet, workbook, theme_palette=None, theme_error=None):
+    """
+    Falls back to the column's <col style="..."> default fill. The caller is
+    responsible for only invoking this when the cell has no explicit style of
+    its own (style_id == 0) - an explicit per-cell style always wins in Excel,
+    even one that resolves to "no fill".
+    """
+    col_idx = cell.column
+    for dim in worksheet.column_dimensions.values():
+        if dim.min <= col_idx <= dim.max and dim.style not in (None, 0, "0"):
+            fg = _style_array_fill(workbook, dim.style)
+            if fg is not None:
+                result = resolve_color_object(fg, theme_palette, theme_error)
+                result["pattern_type"] = "solid"
+                return result
+    return None
+
+
+def resolve_row_default_fill(cell, worksheet, workbook, theme_palette=None, theme_error=None):
+    """Same fallback, for a row's <row s="..." customFormat="1"> default."""
+    row_dim = worksheet.row_dimensions.get(cell.row)
+    if row_dim is None or not getattr(row_dim, "customFormat", False):
+        return None
+    style_id = row_dim.style
+    if style_id in (None, 0, "0"):
+        return None
+    fg = _style_array_fill(workbook, style_id)
+    if fg is None:
+        return None
+    result = resolve_color_object(fg, theme_palette, theme_error)
+    result["pattern_type"] = "solid"
+    return result
