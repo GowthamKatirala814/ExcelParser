@@ -6,6 +6,7 @@ import logging
 import uuid
 from pathlib import Path
 
+import bson
 from bson import ObjectId
 from bson.errors import InvalidId
 from fastapi import APIRouter, BackgroundTasks, HTTPException, UploadFile
@@ -28,6 +29,34 @@ from ..services.transformation_engine import transform_sheet, transform_workbook
 logger = logging.getLogger("app.structuring")
 
 router = APIRouter(prefix="/workbooks", tags=["workbooks"])
+
+# MongoDB rejects any document over 16 MiB. Very large sheets (tens of
+# thousands of cells) can still exceed that even after the compact-row
+# slimming, so extraction degrades gracefully rather than 500-ing: the dense
+# per-cell `structured` grid (rebuildable on demand from the .xlsx via the
+# lossless/intermediate endpoints) is dropped first, then `rows` if needed.
+_MONGO_DOC_SAFE_BYTES = 15_500_000
+
+
+def _fit_extraction_doc(extraction_doc, sheet_name):
+    """Ensures the extraction doc fits under MongoDB's 16 MiB limit, shedding
+    the largest rebuildable fields first and recording what was dropped."""
+    if len(bson.BSON.encode(extraction_doc)) <= _MONGO_DOC_SAFE_BYTES:
+        return
+    logger.warning("extraction doc for sheet '%s' exceeds safe size; shedding heavy fields", sheet_name)
+    extraction_doc["structured"] = {"tables": [], "omitted": True}
+    extraction_doc.setdefault("oversize_notes", []).append(
+        "structured grid omitted (sheet too large for one document); "
+        "use the lossless/intermediate endpoints for full detail"
+    )
+    if len(bson.BSON.encode(extraction_doc)) <= _MONGO_DOC_SAFE_BYTES:
+        return
+    kept = len(extraction_doc.get("rows", []))
+    extraction_doc["rows"] = []
+    extraction_doc["oversize_notes"].append(
+        f"{kept} cell rows omitted (sheet too large for one document); "
+        "use the raw.json / lossless endpoints for full cell data"
+    )
 
 
 def _object_id(workbook_id: str) -> ObjectId:
@@ -261,12 +290,12 @@ async def extract(workbook_id: str, background_tasks: BackgroundTasks):
             "ambiguous_cells": result["ambiguous_cells"],
             "color_inventory": result["color_inventory"],
             "rows": result["rows"],
-            "raw_cells": result["raw_cells"],
             "structured": result["structured"],
             "low_contrast_pairs": result.get("low_contrast_pairs", []),
             "embedded_images": result.get("embedded_images", []),
             "extraction_summary": result.get("extraction_summary"),
         }
+        _fit_extraction_doc(extraction_doc, sheet_name)
         await extractions_collection.insert_one(extraction_doc)
         sheet_summaries[sheet_name] = {
             "processing_time_seconds": result["processing_time_seconds"],

@@ -11,7 +11,6 @@ import openpyxl
 from .cf_resolver import resolve_conditional_format_color
 from .image_detector import detect_images_by_sheet
 from .color_resolver import (
-    resolve_color_object,
     resolve_column_default_fill,
     resolve_direct_fill,
     resolve_row_default_fill,
@@ -20,7 +19,6 @@ from .structure import build_tables
 from .theme_resolver import load_theme_palette
 
 MAX_INVENTORY_EXAMPLES = 5
-_BORDER_SIDES = ("top", "bottom", "left", "right")
 
 # Perceptual (CIE76 Delta-E in LAB space) distance below which two fill colors
 # are generally very hard for a human reviewer to tell apart. 5 is a common,
@@ -72,48 +70,6 @@ def _resolve_cell_color(cell, cell_value, worksheet, workbook, theme_palette, th
         return cf_result
 
     return None  # no fill at all: blank / no-fill cell
-
-
-def _resolve_font_color(cell, theme_palette, theme_error):
-    font = getattr(cell, "font", None)
-    color = getattr(font, "color", None) if font is not None else None
-    if color is None:
-        return None
-    return resolve_color_object(color, theme_palette, theme_error)
-
-
-def _resolve_borders(cell, theme_palette, theme_error):
-    """Returns {side: {"style": str, "color": color-fact}} for sides that actually have a border."""
-    border = getattr(cell, "border", None)
-    if border is None:
-        return {}
-    result = {}
-    for side in _BORDER_SIDES:
-        side_border = getattr(border, side, None)
-        style = getattr(side_border, "style", None) if side_border is not None else None
-        if style is None:
-            continue
-        result[side] = {
-            "style": style,
-            "color": resolve_color_object(
-                getattr(side_border, "color", None), theme_palette, theme_error
-            ),
-        }
-    return result
-
-
-def _resolve_comment(cell):
-    comment = getattr(cell, "comment", None)
-    if comment is None:
-        return None
-    return {"text": comment.text, "author": comment.author}
-
-
-def _resolve_formula(formula_cell):
-    """formula_cell comes from a parallel data_only=False load; None if not applicable."""
-    if formula_cell is None or formula_cell.data_type != "f":
-        return None
-    return formula_cell.value
 
 
 def _inventory_key(color_result):
@@ -299,7 +255,6 @@ def extract_sheet(
     worksheet,
     theme_palette=None,
     theme_error=None,
-    formula_worksheet=None,
     embedded_images=None,
 ):
     anchor_to_members, member_to_anchor = _build_merge_maps(worksheet)
@@ -362,8 +317,12 @@ def extract_sheet(
                 # Skip emitting a separate row for non-anchor merged members.
                 continue
 
-            formula_cell = formula_worksheet[ref] if formula_worksheet is not None else None
-
+            # The compact rows carry only what the app consumes (value, color,
+            # merges, label). Full per-cell fidelity - font color, borders,
+            # comments, formulas - lives in the lossless representation
+            # (services/lossless_extractor.py, generated on demand, not stored
+            # in Mongo). Duplicating that here previously tripled each cell's
+            # size and pushed large sheets past MongoDB's 16 MB document limit.
             rows.append(
                 {
                     "cell_ref": ref,
@@ -378,10 +337,6 @@ def extract_sheet(
                         if color_result
                         else None,
                     },
-                    "font_color": _resolve_font_color(cell, theme_palette, theme_error),
-                    "borders": _resolve_borders(cell, theme_palette, theme_error),
-                    "comment": _resolve_comment(cell),
-                    "formula": _resolve_formula(formula_cell),
                     "merged_with": anchor_to_members.get(ref, []),
                     "human_label": None,
                 }
@@ -397,22 +352,10 @@ def extract_sheet(
         rows, unresolved_cells, embedded_images, low_contrast_pairs, worksheet
     )
 
-    raw_cells = {
-        "total_cells": total_cells,
-        "colored_cells": colored_cells,
-        "blank_cells": blank_cells,
-        "unresolved_cells": unresolved_cells,
-        "ambiguous_cells": ambiguous_cells,
-        "color_inventory": color_inventory,
-        "rows": rows,
-    }
-
     raw_by_ref = {row["cell_ref"]: row for row in rows}
     structured = {"tables": build_tables(worksheet, raw_by_ref, member_to_anchor)}
 
     return {
-        # Flat fields kept for backward compatibility with existing callers
-        # (routers, reports) - never removed or degraded.
         "total_cells": total_cells,
         "colored_cells": colored_cells,
         "blank_cells": blank_cells,
@@ -420,11 +363,8 @@ def extract_sheet(
         "ambiguous_cells": ambiguous_cells,
         "color_inventory": color_inventory,
         "rows": rows,
-        # New: explicit raw/structured split, side by side, per the
-        # workbook -> sheets -> tables -> rows -> cells hierarchy.
-        "raw_cells": raw_cells,
         "structured": structured,
-        # New advisory-only flags (isolated; nothing above depends on them).
+        # Advisory-only flags (isolated; nothing above depends on them).
         "low_contrast_pairs": low_contrast_pairs,
         "embedded_images": embedded_images,
         "extraction_summary": extraction_summary,
@@ -438,10 +378,6 @@ def extract_workbook(file_path):
     """
     workbook_start = time.perf_counter()
     workbook = openpyxl.load_workbook(file_path, data_only=True)
-    # A second, parallel load with formulas intact (data_only=True replaces
-    # formula cells with their cached computed value, so formula text can
-    # only be read from a workbook opened without that flag).
-    formula_workbook = openpyxl.load_workbook(file_path, data_only=False)
     theme_palette, theme_error = load_theme_palette(file_path)
     # Detected once from the .xlsx package directly (dependency-free), then
     # handed to each sheet - never via openpyxl/Pillow, so images are not
@@ -451,14 +387,12 @@ def extract_workbook(file_path):
     per_sheet_results = {}
     for sheet_name in workbook.sheetnames:
         worksheet = workbook[sheet_name]
-        formula_worksheet = formula_workbook[sheet_name]
         sheet_start = time.perf_counter()
         result = extract_sheet(
             workbook,
             worksheet,
             theme_palette,
             theme_error,
-            formula_worksheet,
             embedded_images=images_by_sheet.get(sheet_name, []),
         )
         result["processing_time_seconds"] = time.perf_counter() - sheet_start
